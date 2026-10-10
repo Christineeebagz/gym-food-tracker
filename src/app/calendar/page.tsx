@@ -1,15 +1,33 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { getAllGymSessions, getAllFastingLogs } from "@/lib/db";
-import type { GymSession, SetEntry, FastingLog } from "@/types/schema";
+import {
+  getAllGymSessions,
+  getAllFastingLogs,
+  getGymSessionsInRange,
+  getFastingLogsInRange,
+  getSettings,
+} from "@/lib/db";
+import type {
+  GymSession,
+  SetEntry,
+  FastingLog,
+  CompletedSet,
+} from "@/types/schema";
 import { dateToString, todayString } from "@/lib/date";
 
-function formatSet(set: SetEntry): string {
+function formatSet(set: SetEntry, weightUnit: string): string {
   if (set.skipped) return "skipped";
   return set.weight !== undefined
-    ? `${set.reps} reps @ ${set.weight}kg`
+    ? `${set.reps} reps @ ${set.weight}${weightUnit}`
     : `${set.reps} reps`;
+}
+
+function formatClock(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 const MONTH_NAMES = [
@@ -27,8 +45,96 @@ const MONTH_NAMES = [
   "December",
 ];
 
+// ---- CSV helpers: no library, just string building + a Blob download ----
+
+function escapeCsvField(value: string | number): string {
+  const str = String(value);
+  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function toCsv(rows: (string | number)[][]): string {
+  return rows.map((row) => row.map(escapeCsvField).join(",")).join("\n");
+}
+
+function downloadFile(filename: string, content: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function gymSessionsToCsvRows(sessions: GymSession[]): (string | number)[][] {
+  const rows: (string | number)[][] = [
+    [
+      "date",
+      "workoutType",
+      "exercise",
+      "setNumber",
+      "skipped",
+      "reps",
+      "weight",
+    ],
+  ];
+  for (const session of sessions) {
+    for (const ex of session.exercises) {
+      for (const set of ex.sets) {
+        const completed: CompletedSet | null = set.skipped ? null : set;
+        rows.push([
+          session.date,
+          session.workoutTypeName,
+          ex.name,
+          set.setNumber,
+          set.skipped ? "yes" : "no",
+          completed ? completed.reps : "",
+          completed ? (completed.weight ?? "") : "",
+        ]);
+      }
+    }
+  }
+  return rows;
+}
+
+function fastingLogsToCsvRows(logs: FastingLog[]): (string | number)[][] {
+  const rows: (string | number)[][] = [
+    [
+      "date",
+      "firstMeal",
+      "windowEnds",
+      "windowHours",
+      "status",
+      "breaksCount",
+      "breakNotes",
+    ],
+  ];
+  for (const log of logs) {
+    const breakNotes = log.breaks
+      .map((b) => b.note)
+      .filter(Boolean)
+      .join("; ");
+    rows.push([
+      log.date,
+      formatClock(log.firstMealAt),
+      formatClock(log.windowEndsAt),
+      log.windowHours,
+      log.status,
+      log.breaks.length,
+      breakNotes,
+    ]);
+  }
+  return rows;
+}
+
 function Calendar() {
   const [sessions, setSessions] = useState<GymSession[]>([]);
+  const [weightUnit, setWeightUnit] = useState<"kg" | "lb">("kg");
   const [fastingLogs, setFastingLogs] = useState<FastingLog[]>([]);
   const [loading, setLoading] = useState(true);
   const today = todayString();
@@ -37,13 +143,27 @@ function Calendar() {
   const [viewMonth, setViewMonth] = useState(now.getMonth());
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
 
+  const [showExport, setShowExport] = useState(false);
+  const [exportStart, setExportStart] = useState(today);
+  const [exportEnd, setExportEnd] = useState(today);
+  const [exportGym, setExportGym] = useState(true);
+  const [exportFasting, setExportFasting] = useState(true);
+  const [exporting, setExporting] = useState(false);
+  const [printPreview, setPrintPreview] = useState<{
+    start: string;
+    end: string;
+    sessions: GymSession[];
+    fastingLogs: FastingLog[];
+  } | null>(null);
+
   useEffect(() => {
     let ignore = false;
-    Promise.all([getAllGymSessions(), getAllFastingLogs()]).then(
-      ([gymData, fastingData]) => {
+    Promise.all([getAllGymSessions(), getAllFastingLogs(), getSettings()]).then(
+      ([gymData, fastingData, settings]) => {
         if (!ignore) {
           setSessions(gymData);
           setFastingLogs(fastingData);
+          setWeightUnit(settings.weightUnit);
           setLoading(false);
         }
       },
@@ -104,8 +224,6 @@ function Calendar() {
     return "bg-yellow-100 text-yellow-700";
   };
 
-  // Gym gets the cell's main color. Fasting status rides along as a small
-  // dot instead, since a day can be strong on one and not the other.
   const fastingDotFor = (dateStr: string): string | null => {
     const log = fastingByDate.get(dateStr);
     if (!log) return null;
@@ -120,6 +238,155 @@ function Calendar() {
   const selectedFasting = selectedDate
     ? fastingByDate.get(selectedDate)
     : undefined;
+
+  const setPresetRange = (days: number) => {
+    const end = new Date();
+    const start = new Date();
+    start.setDate(start.getDate() - (days - 1));
+    setExportStart(dateToString(start));
+    setExportEnd(dateToString(end));
+  };
+
+  const setThisMonthRange = () => {
+    setExportStart(dateToString(new Date(viewYear, viewMonth, 1)));
+    setExportEnd(dateToString(new Date(viewYear, viewMonth + 1, 0)));
+  };
+
+  const handleDownloadCsv = async () => {
+    setExporting(true);
+    if (exportGym) {
+      const gymData = await getGymSessionsInRange(exportStart, exportEnd);
+      downloadFile(
+        `gym-sessions_${exportStart}_to_${exportEnd}.csv`,
+        "\uFEFF" + toCsv(gymSessionsToCsvRows(gymData)),
+        "text/csv;charset=utf-8;",
+      );
+    }
+    if (exportFasting) {
+      const fastingData = await getFastingLogsInRange(exportStart, exportEnd);
+      downloadFile(
+        `fasting_${exportStart}_to_${exportEnd}.csv`,
+        "\uFEFF" + toCsv(fastingLogsToCsvRows(fastingData)),
+        "text/csv;charset=utf-8;",
+      );
+    }
+    setExporting(false);
+  };
+
+  const handlePreviewForPrint = async () => {
+    setExporting(true);
+    const [gymData, fastingData] = await Promise.all([
+      exportGym
+        ? getGymSessionsInRange(exportStart, exportEnd)
+        : Promise.resolve([]),
+      exportFasting
+        ? getFastingLogsInRange(exportStart, exportEnd)
+        : Promise.resolve([]),
+    ]);
+    setPrintPreview({
+      start: exportStart,
+      end: exportEnd,
+      sessions: gymData,
+      fastingLogs: fastingData,
+    });
+    setExporting(false);
+  };
+
+  if (printPreview) {
+    return (
+      <div className="mx-auto max-w-2xl p-6">
+        <div className="mb-6 flex gap-2 print:hidden">
+          <button
+            onClick={() => setPrintPreview(null)}
+            className="text-sm text-blue-600"
+          >
+            ← Back to calendar
+          </button>
+          <button
+            onClick={() => window.print()}
+            className="ml-auto rounded bg-black px-4 py-2 text-sm text-white"
+          >
+            Print / Save as PDF
+          </button>
+        </div>
+
+        <h1 className="mb-1 text-xl font-semibold">
+          {printPreview.start} to {printPreview.end}
+        </h1>
+        <p className="mb-6 text-xs text-zinc-500 print:hidden">
+          In the print dialog, choose &quot;Save as PDF&quot; as the
+          destination.
+        </p>
+
+        {exportGym && (
+          <section className="mb-8">
+            <h2 className="mb-3 text-lg font-semibold">Gym sessions</h2>
+            {printPreview.sessions.length === 0 ? (
+              <p className="text-sm text-zinc-500">
+                No sessions in this range.
+              </p>
+            ) : (
+              printPreview.sessions.map((session) => (
+                <div key={session.id} className="mb-3">
+                  <p className="font-medium">
+                    {session.date} — {session.workoutTypeName}
+                  </p>
+                  <div className="pl-4 text-sm text-zinc-700">
+                    {session.exercises.map((ex, i) => (
+                      <p key={i}>
+                        {ex.name}:{" "}
+                        {ex.sets
+                          .map((s) => formatSet(s, weightUnit))
+                          .join(", ")}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              ))
+            )}
+          </section>
+        )}
+
+        {exportFasting && (
+          <section>
+            <h2 className="mb-3 text-lg font-semibold">Fasting</h2>
+            {printPreview.fastingLogs.length === 0 ? (
+              <p className="text-sm text-zinc-500">
+                No fasting logs in this range.
+              </p>
+            ) : (
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b text-left">
+                    <th className="py-1 pr-3">Date</th>
+                    <th className="py-1 pr-3">First meal</th>
+                    <th className="py-1 pr-3">Window ends</th>
+                    <th className="py-1 pr-3">Status</th>
+                    <th className="py-1">Breaks</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {printPreview.fastingLogs.map((log) => (
+                    <tr key={log.date} className="border-b">
+                      <td className="py-1 pr-3">{log.date}</td>
+                      <td className="py-1 pr-3">
+                        {formatClock(log.firstMealAt)}
+                      </td>
+                      <td className="py-1 pr-3">
+                        {formatClock(log.windowEndsAt)}
+                      </td>
+                      <td className="py-1 pr-3">{log.status}</td>
+                      <td className="py-1">{log.breaks.length}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto max-w-2xl p-6">
@@ -201,6 +468,95 @@ function Calendar() {
         </div>
       </div>
 
+      <div className="mt-6 border-t pt-4">
+        {!showExport ? (
+          <button
+            onClick={() => setShowExport(true)}
+            className="text-sm text-blue-600"
+          >
+            Export data
+          </button>
+        ) : (
+          <div className="space-y-3 rounded border p-3">
+            <div className="flex flex-wrap gap-2 text-sm">
+              <button
+                onClick={() => setPresetRange(7)}
+                className="rounded border px-2 py-1"
+              >
+                Last 7 days
+              </button>
+              <button
+                onClick={() => setPresetRange(30)}
+                className="rounded border px-2 py-1"
+              >
+                Last 30 days
+              </button>
+              <button
+                onClick={setThisMonthRange}
+                className="rounded border px-2 py-1"
+              >
+                This month
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <input
+                type="date"
+                value={exportStart}
+                onChange={(e) => setExportStart(e.target.value)}
+                className="rounded border px-2 py-1"
+              />
+              <span>to</span>
+              <input
+                type="date"
+                value={exportEnd}
+                onChange={(e) => setExportEnd(e.target.value)}
+                className="rounded border px-2 py-1"
+              />
+            </div>
+            <div className="flex gap-4 text-sm">
+              <label className="flex items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={exportGym}
+                  onChange={(e) => setExportGym(e.target.checked)}
+                />
+                Gym
+              </label>
+              <label className="flex items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={exportFasting}
+                  onChange={(e) => setExportFasting(e.target.checked)}
+                />
+                Fasting
+              </label>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={handleDownloadCsv}
+                disabled={exporting || (!exportGym && !exportFasting)}
+                className="rounded bg-black px-3 py-1 text-sm text-white disabled:bg-zinc-300"
+              >
+                {exporting ? "Working..." : "Download CSV"}
+              </button>
+              <button
+                onClick={handlePreviewForPrint}
+                disabled={exporting || (!exportGym && !exportFasting)}
+                className="rounded border px-3 py-1 text-sm disabled:text-zinc-300"
+              >
+                Preview for PDF
+              </button>
+              <button
+                onClick={() => setShowExport(false)}
+                className="text-sm text-zinc-400"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
       {selectedDate && (
         <div className="mt-6 border-t pt-4">
           <h2 className="mb-2 text-sm font-semibold text-zinc-500">
@@ -239,7 +595,9 @@ function Calendar() {
                     {session.exercises.map((ex, i) => (
                       <div key={i}>
                         <span className="font-medium">{ex.name}:</span>{" "}
-                        {ex.sets.map((s) => formatSet(s)).join(", ")}
+                        {ex.sets
+                          .map((s) => formatSet(s, weightUnit))
+                          .join(", ")}
                       </div>
                     ))}
                   </div>

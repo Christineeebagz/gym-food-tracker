@@ -3,7 +3,13 @@ import Link from "next/link";
 export default function Home() {
   return (
     <div className="mx-auto max-w-lg p-6">
-      <h1 className="mb-6 text-xl font-semibold">Gym &amp; food tracker</h1>
+      {/* <h1 className="mb-6 text-xl font-semibold">Gym &amp; food tracker</h1> */}
+      <div className="mb-6 flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Gym &amp; food tracker</h1>
+        <Link href="/settings" className="text-xl" title="Settings">
+          ⚙️
+        </Link>
+      </div>
 
       <Link
         href="/log-session"

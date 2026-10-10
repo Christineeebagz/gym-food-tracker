@@ -207,3 +207,7 @@ export async function getFastingLogsInRange(
   const snap = await getDocs(q);
   return snap.docs.map((d) => d.data() as FastingLog);
 }
+
+export async function upsertSettings(settings: AppSettings): Promise<void> {
+  await setDoc(doc(db, "settings", "default"), settings);
+}
